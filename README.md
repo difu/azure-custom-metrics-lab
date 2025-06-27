@@ -9,7 +9,7 @@ This project deploys an Ubuntu VM that automatically performs DNS queries every 
 ## Architecture
 
 - **Azure VM**: Ubuntu 22.04 LTS with managed identity
-- **DNS Monitoring**: Python script with cron job (runs every minute)
+- **DNS Monitoring**: Configurable Python or shell script with cron job (runs every minute)
 - **Custom Metrics**: Sent to Azure Monitor with dimensions for stage, domain, VM name, and metric type
 - **Log Analytics**: Workspace for centralized logging
 
@@ -56,6 +56,7 @@ This project deploys an Ubuntu VM that automatically performs DNS queries every 
 Key variables in `terraform.tfvars`:
 - `stage`: Environment (dev/prelive/live)
 - `target_domain`: Domain to monitor (default: example.com)
+- `monitor_script_type`: Choose between "python" (default) or "shell" implementation
 - `vm_size`: VM size (default: Standard_B2s)
 - `location`: Azure region (default: West Europe)
 
@@ -65,7 +66,12 @@ The system sends these metrics to Azure Monitor:
 - **DNS_Query_Metrics**: Duration and success rate
 - **Dimensions**: stage, domain, vm_name, metric_type
 
-Metrics are extensible - modify the Python script in `cloud-init.yml` to add new monitoring capabilities.
+Metrics are extensible - modify the monitoring script in `cloud-init.yml` (Python) or `cloud-init-shell.yml` (shell) to add new monitoring capabilities.
+
+### Script Implementation Options
+
+- **Python** (`monitor_script_type = "python"`): Uses Python 3 with requests library
+- **Shell** (`monitor_script_type = "shell"`): Pure bash script using curl, jq, dig, and bc
 
 ![Azure Custom Metrics](pics/metrics.png)
 
