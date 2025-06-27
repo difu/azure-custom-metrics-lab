@@ -1,0 +1,304 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - jq
+  - dig
+  - python3
+  - python3-pip
+  - cron
+
+write_files:
+  - path: /opt/dns-monitor/dns-monitor.py
+    content: |
+      #!/usr/bin/env python3
+      import json
+      import subprocess
+      import time
+      import sys
+      import os
+      from datetime import datetime
+      import requests
+
+      class DNSMonitor:
+          def __init__(self, target_domain, stage):
+              self.target_domain = target_domain
+              self.stage = stage
+              self.vm_name = self._get_vm_name()
+              self.resource_group = self._get_resource_group()
+              self.subscription_id = self._get_subscription_id()
+              
+          def _get_vm_name(self):
+              try:
+                  result = subprocess.run(['curl', '-s', '-H', 'Metadata:true', 
+                                         'http://169.254.169.254/metadata/instance/compute/name?api-version=2021-12-13&format=text'],
+                                        capture_output=True, text=True, timeout=10)
+                  if result.returncode == 0:
+                      response = result.stdout.strip()
+                      try:
+                          # Try parsing as JSON first (in case of error response)
+                          parsed = json.loads(response)
+                          if isinstance(parsed, dict) and 'error' in parsed:
+                              print(f"VM metadata error: {parsed}")
+                              return "unknown"
+                          return str(parsed).strip('"')
+                      except json.JSONDecodeError:
+                          # If not JSON, treat as plain text
+                          return response.strip('"')
+                  return "unknown"
+              except Exception as e:
+                  print(f"Error getting VM name: {e}")
+                  return "unknown"
+                  
+          def _get_resource_group(self):
+              try:
+                  result = subprocess.run(['curl', '-s', '-H', 'Metadata:true', 
+                                         'http://169.254.169.254/metadata/instance/compute/resourceGroupName?api-version=2021-12-13&format=text'],
+                                        capture_output=True, text=True, timeout=10)
+                  if result.returncode == 0:
+                      response = result.stdout.strip()
+                      try:
+                          # Try parsing as JSON first (in case of error response)
+                          parsed = json.loads(response)
+                          if isinstance(parsed, dict) and 'error' in parsed:
+                              print(f"Resource group metadata error: {parsed}")
+                              return "unknown"
+                          return str(parsed).strip('"')
+                      except json.JSONDecodeError:
+                          # If not JSON, treat as plain text
+                          return response.strip('"')
+                  return "unknown"
+              except Exception as e:
+                  print(f"Error getting resource group: {e}")
+                  return "unknown"
+                  
+          def _get_subscription_id(self):
+              try:
+                  result = subprocess.run(['curl', '-s', '-H', 'Metadata:true', 
+                                         'http://169.254.169.254/metadata/instance/compute/subscriptionId?api-version=2021-12-13&format=text'],
+                                        capture_output=True, text=True, timeout=10)
+                  if result.returncode == 0:
+                      response = result.stdout.strip()
+                      try:
+                          # Try parsing as JSON first (in case of error response)
+                          parsed = json.loads(response)
+                          if isinstance(parsed, dict) and 'error' in parsed:
+                              print(f"Subscription ID metadata error: {parsed}")
+                              return "unknown"
+                          return str(parsed).strip('"')
+                      except json.JSONDecodeError:
+                          # If not JSON, treat as plain text
+                          return response.strip('"')
+                  return "unknown"
+              except Exception as e:
+                  print(f"Error getting subscription ID: {e}")
+                  return "unknown"
+                  
+          def _get_vm_location(self):
+              try:
+                  result = subprocess.run(['curl', '-s', '-H', 'Metadata:true', 
+                                         'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-12-13&format=text'],
+                                        capture_output=True, text=True, timeout=10)
+                  if result.returncode == 0:
+                      response = result.stdout.strip()
+                      try:
+                          # Try parsing as JSON first (in case of error response)
+                          parsed = json.loads(response)
+                          if isinstance(parsed, dict) and 'error' in parsed:
+                              print(f"VM location metadata error: {parsed}")
+                              return "westeurope"  # default fallback
+                          return str(parsed).strip('"')
+                      except json.JSONDecodeError:
+                          # If not JSON, treat as plain text
+                          return response.strip('"')
+                  return "westeurope"  # default fallback
+              except Exception as e:
+                  print(f"Error getting VM location: {e}")
+                  return "westeurope"  # default fallback
+
+          def _get_access_token(self):
+              try:
+                  result = subprocess.run(['curl', '-s', '-H', 'Metadata:true', 
+                                         'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://monitor.azure.com/'],
+                                        capture_output=True, text=True, timeout=10)
+                  token_data = json.loads(result.stdout)
+                  return token_data.get('access_token')
+              except Exception as e:
+                  print(f"Error getting access token: {e}")
+                  return None
+
+          def perform_dns_query(self):
+              start_time = time.time()
+              try:
+                  result = subprocess.run(['dig', '+short', self.target_domain], 
+                                        capture_output=True, text=True, timeout=30)
+                  end_time = time.time()
+                  
+                  duration_ms = (end_time - start_time) * 1000
+                  
+                  if result.returncode == 0 and result.stdout.strip():
+                      return {
+                          'success': True,
+                          'duration_ms': duration_ms,
+                          'response': result.stdout.strip(),
+                          'error': None
+                      }
+                  else:
+                      return {
+                          'success': False,
+                          'duration_ms': duration_ms,
+                          'response': None,
+                          'error': result.stderr.strip() or 'No response received'
+                      }
+              except subprocess.TimeoutExpired:
+                  return {
+                      'success': False,
+                      'duration_ms': 30000,
+                      'response': None,
+                      'error': 'DNS query timeout'
+                  }
+              except Exception as e:
+                  return {
+                      'success': False,
+                      'duration_ms': 0,
+                      'response': None,
+                      'error': str(e)
+                  }
+
+          def send_custom_metrics(self, metrics_data):
+              access_token = self._get_access_token()
+              if not access_token:
+                  print("Failed to get access token")
+                  return False
+
+              # Get VM location for regional endpoint
+              vm_location = self._get_vm_location()
+              
+              # Use the correct Azure Monitor custom metrics endpoint
+              vm_resource_id = f"/subscriptions/{self.subscription_id}/resourceGroups/{self.resource_group}/providers/Microsoft.Compute/virtualMachines/{self.vm_name}"
+              url = f"https://{vm_location}.monitoring.azure.com{vm_resource_id}/metrics"
+              
+              headers = {
+                  'Authorization': f'Bearer {access_token}',
+                  'Content-Type': 'application/json'
+              }
+
+              timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+              
+              # Create duration metric payload
+              duration_payload = {
+                  "time": timestamp,
+                  "data": {
+                      "baseData": {
+                          "metric": "DNS_Query_Duration",
+                          "namespace": "Custom/DNS",
+                          "dimNames": ["stage", "domain", "vm_name"],
+                          "series": [{
+                              "dimValues": [self.stage, self.target_domain, self.vm_name],
+                              "min": metrics_data['duration_ms'],
+                              "max": metrics_data['duration_ms'],
+                              "sum": metrics_data['duration_ms'],
+                              "count": 1
+                          }]
+                      }
+                  }
+              }
+
+              # Send duration metric
+              try:
+                  response1 = requests.post(url, headers=headers, json=duration_payload, timeout=30)
+                  
+                  success_value = 1 if metrics_data['success'] else 0
+                  success_payload = {
+                      "time": timestamp,
+                      "data": {
+                          "baseData": {
+                              "metric": "DNS_Query_Success",
+                              "namespace": "Custom/DNS",
+                              "dimNames": ["stage", "domain", "vm_name"],
+                              "series": [{
+                                  "dimValues": [self.stage, self.target_domain, self.vm_name],
+                                  "min": success_value,
+                                  "max": success_value,
+                                  "sum": success_value,
+                                  "count": 1
+                              }]
+                          }
+                      }
+                  }
+                  
+                  # Send success metric
+                  response2 = requests.post(url, headers=headers, json=success_payload, timeout=30)
+                  
+                  if response1.status_code == 200 and response2.status_code == 200:
+                      print(f"Metrics sent successfully: {timestamp}")
+                      return True
+                  else:
+                      print(f"Failed to send metrics: Duration={response1.status_code}, Success={response2.status_code}")
+                      if response1.status_code != 200:
+                          print(f"Duration response: {response1.text}")
+                      if response2.status_code != 200:
+                          print(f"Success response: {response2.text}")
+                      return False
+              except Exception as e:
+                  print(f"Error sending metrics: {e}")
+                  return False
+
+          def log_to_file(self, metrics_data):
+              log_entry = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'stage': self.stage,
+                  'domain': self.target_domain,
+                  'vm_name': self.vm_name,
+                  'success': metrics_data['success'],
+                  'duration_ms': metrics_data['duration_ms'],
+                  'response': metrics_data['response'],
+                  'error': metrics_data['error']
+              }
+              
+              with open('/var/log/dns-monitor.log', 'a') as f:
+                  f.write(json.dumps(log_entry) + '\n')
+
+          def run_check(self):
+              print(f"Performing DNS check for {self.target_domain} (stage: {self.stage})")
+              
+              metrics_data = self.perform_dns_query()
+              
+              self.log_to_file(metrics_data)
+              
+              if not self.send_custom_metrics(metrics_data):
+                  print("Failed to send custom metrics to Azure")
+              
+              status = "SUCCESS" if metrics_data['success'] else "FAILED"
+              print(f"DNS check {status}: {metrics_data['duration_ms']:.2f}ms")
+              
+              if not metrics_data['success']:
+                  print(f"Error: {metrics_data['error']}")
+
+      if __name__ == "__main__":
+          target_domain = sys.argv[1] if len(sys.argv) > 1 else "${target_domain}"
+          stage = sys.argv[2] if len(sys.argv) > 2 else "${stage}"
+          
+          monitor = DNSMonitor(target_domain, stage)
+          monitor.run_check()
+    permissions: '0755'
+
+  - path: /etc/cron.d/dns-monitor
+    content: |
+      # DNS Monitor Cron Job - runs every minute
+      * * * * * root /opt/dns-monitor/dns-monitor.py >> /var/log/dns-monitor-cron.log 2>&1
+    permissions: '0644'
+
+runcmd:
+  - mkdir -p /opt/dns-monitor
+  - pip3 install requests
+  - touch /var/log/dns-monitor.log
+  - touch /var/log/dns-monitor-cron.log
+  - chmod 644 /var/log/dns-monitor.log
+  - chmod 644 /var/log/dns-monitor-cron.log
+  - systemctl enable cron
+  - systemctl start cron
+  - echo "DNS Monitor setup completed" >> /var/log/cloud-init-output.log
+  - /opt/dns-monitor/dns-monitor.py

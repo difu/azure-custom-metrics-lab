@@ -1,0 +1,21 @@
+# Copy this file to terraform.tfvars and customize the values
+
+# Resource Group Configuration
+resource_group_name = "rg-custom-metrics-lab"
+location           = "West Europe"
+
+# Project Configuration
+project_name = "custom-metrics-lab"
+
+# VM Configuration
+vm_size        = "Standard_B2s"
+admin_username = "azureuser"
+
+# SSH Key Path (update this to your actual SSH public key path)
+ssh_public_key_path = "~/.ssh/id_rsa.pub"
+
+# Environment Stage (dev, prelive, live)
+stage = "dev"
+
+# Target Domain for DNS Monitoring
+target_domain = "example.com"
