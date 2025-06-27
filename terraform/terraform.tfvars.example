@@ -19,3 +19,6 @@ stage = "dev"
 
 # Target Domain for DNS Monitoring
 target_domain = "example.com"
+
+# Monitor Script Type (python or shell)
+monitor_script_type = "python"

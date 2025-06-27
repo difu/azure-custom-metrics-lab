@@ -116,7 +116,7 @@ resource "azurerm_linux_virtual_machine" "main" {
     type = "SystemAssigned"
   }
 
-  custom_data = base64encode(templatefile("${path.module}/cloud-init.yml", {
+  custom_data = base64encode(templatefile("${path.module}/cloud-init${var.monitor_script_type == "shell" ? "-shell" : ""}.yml", {
     workspace_id  = azurerm_log_analytics_workspace.main.workspace_id
     workspace_key = azurerm_log_analytics_workspace.main.primary_shared_key
     stage         = var.stage

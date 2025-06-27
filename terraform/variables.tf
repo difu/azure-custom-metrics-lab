@@ -50,3 +50,14 @@ variable "target_domain" {
   type        = string
   default     = "example.com"
 }
+
+variable "monitor_script_type" {
+  description = "Type of monitoring script to use (python or shell)"
+  type        = string
+  default     = "python"
+  
+  validation {
+    condition     = contains(["python", "shell"], var.monitor_script_type)
+    error_message = "Monitor script type must be either 'python' or 'shell'."
+  }
+}

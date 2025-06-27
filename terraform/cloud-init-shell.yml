@@ -1,0 +1,242 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - jq
+  - dig
+  - bc
+  - cron
+
+write_files:
+  - path: /opt/dns-monitor/dns-monitor.sh
+    content: |
+      #!/bin/bash
+
+      set -euo pipefail
+
+      TARGET_DOMAIN="${1:-${target_domain}}"
+      STAGE="${2:-${stage}}"
+
+      get_vm_metadata() {
+          local endpoint="$1"
+          local result
+          if result=$(curl -s -H "Metadata:true" "http://169.254.169.254/metadata/instance/compute/${endpoint}?api-version=2021-12-13&format=text" 2>/dev/null); then
+              echo "$result" | tr -d '"'
+          else
+              echo "unknown"
+          fi
+      }
+
+      get_access_token() {
+          local result
+          if result=$(curl -s -H "Metadata:true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://monitor.azure.com/" 2>/dev/null); then
+              echo "$result" | jq -r '.access_token // empty'
+          fi
+      }
+
+      perform_dns_query() {
+          local start_time end_time duration_ms
+          start_time=$(date +%s.%3N)
+          
+          if dig +short "$TARGET_DOMAIN" >/tmp/dns_result 2>/tmp/dns_error; then
+              end_time=$(date +%s.%3N)
+              duration_ms=$(echo "($end_time - $start_time) * 1000" | bc)
+              
+              if [ -s /tmp/dns_result ]; then
+                  echo "success:true"
+                  echo "duration_ms:$duration_ms"
+                  echo "response:$(cat /tmp/dns_result | tr '\n' ' ')"
+                  echo "error:"
+              else
+                  echo "success:false"
+                  echo "duration_ms:$duration_ms"
+                  echo "response:"
+                  echo "error:No response received"
+              fi
+          else
+              end_time=$(date +%s.%3N)
+              duration_ms=$(echo "($end_time - $start_time) * 1000" | bc)
+              echo "success:false"
+              echo "duration_ms:$duration_ms"
+              echo "response:"
+              echo "error:$(cat /tmp/dns_error 2>/dev/null || echo 'DNS query failed')"
+          fi
+          
+          rm -f /tmp/dns_result /tmp/dns_error
+      }
+
+      send_custom_metrics() {
+          local success="$1"
+          local duration_ms="$2"
+          local vm_name vm_location subscription_id resource_group access_token
+          local timestamp url response_code
+          
+          vm_name=$(get_vm_metadata "name")
+          vm_location=$(get_vm_metadata "location")
+          subscription_id=$(get_vm_metadata "subscriptionId")
+          resource_group=$(get_vm_metadata "resourceGroupName")
+          access_token=$(get_access_token)
+          
+          if [ -z "$access_token" ] || [ "$access_token" = "null" ]; then
+              echo "Failed to get access token"
+              return 1
+          fi
+          
+          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+          url="https://$${vm_location}.monitoring.azure.com/subscriptions/$${subscription_id}/resourceGroups/$${resource_group}/providers/Microsoft.Compute/virtualMachines/$${vm_name}/metrics"
+          
+          # Send duration metric
+          duration_payload=$(jq -n --arg timestamp "$timestamp" \
+                                  --arg stage "$STAGE" \
+                                  --arg domain "$TARGET_DOMAIN" \
+                                  --arg vm_name "$vm_name" \
+                                  --argjson duration "$duration_ms" \
+              '{
+                  time: $timestamp,
+                  data: {
+                      baseData: {
+                          metric: "DNS_Query_Duration",
+                          namespace: "Custom/DNS",
+                          dimNames: ["stage", "domain", "vm_name"],
+                          series: [{
+                              dimValues: [$stage, $domain, $vm_name],
+                              min: $duration,
+                              max: $duration,
+                              sum: $duration,
+                              count: 1
+                          }]
+                      }
+                  }
+              }')
+          
+          response_code=$(curl -s -w "%{http_code}" -o /tmp/metric_response1 \
+              -H "Authorization: Bearer $access_token" \
+              -H "Content-Type: application/json" \
+              -X POST \
+              -d "$duration_payload" \
+              "$url")
+          
+          # Send success metric
+          local success_value
+          success_value=$([ "$success" = "true" ] && echo 1 || echo 0)
+          
+          success_payload=$(jq -n --arg timestamp "$timestamp" \
+                                  --arg stage "$STAGE" \
+                                  --arg domain "$TARGET_DOMAIN" \
+                                  --arg vm_name "$vm_name" \
+                                  --argjson success_val "$success_value" \
+              '{
+                  time: $timestamp,
+                  data: {
+                      baseData: {
+                          metric: "DNS_Query_Success",
+                          namespace: "Custom/DNS",
+                          dimNames: ["stage", "domain", "vm_name"],
+                          series: [{
+                              dimValues: [$stage, $domain, $vm_name],
+                              min: $success_val,
+                              max: $success_val,
+                              sum: $success_val,
+                              count: 1
+                          }]
+                      }
+                  }
+              }')
+          
+          response_code2=$(curl -s -w "%{http_code}" -o /tmp/metric_response2 \
+              -H "Authorization: Bearer $access_token" \
+              -H "Content-Type: application/json" \
+              -X POST \
+              -d "$success_payload" \
+              "$url")
+          
+          if [ "$response_code" = "200" ] && [ "$response_code2" = "200" ]; then
+              echo "Metrics sent successfully: $timestamp"
+              rm -f /tmp/metric_response1 /tmp/metric_response2
+              return 0
+          else
+              echo "Failed to send metrics: Duration=$response_code, Success=$response_code2"
+              [ "$response_code" != "200" ] && echo "Duration response: $(cat /tmp/metric_response1 2>/dev/null)"
+              [ "$response_code2" != "200" ] && echo "Success response: $(cat /tmp/metric_response2 2>/dev/null)"
+              rm -f /tmp/metric_response1 /tmp/metric_response2
+              return 1
+          fi
+      }
+
+      log_to_file() {
+          local success="$1"
+          local duration_ms="$2"
+          local response="$3"
+          local error="$4"
+          local vm_name timestamp log_entry
+          
+          vm_name=$(get_vm_metadata "name")
+          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+          
+          log_entry=$(jq -n --arg timestamp "$timestamp" \
+                            --arg stage "$STAGE" \
+                            --arg domain "$TARGET_DOMAIN" \
+                            --arg vm_name "$vm_name" \
+                            --arg success "$success" \
+                            --argjson duration "$duration_ms" \
+                            --arg response "$response" \
+                            --arg error "$error" \
+              '{
+                  timestamp: $timestamp,
+                  stage: $stage,
+                  domain: $domain,
+                  vm_name: $vm_name,
+                  success: ($success == "true"),
+                  duration_ms: $duration,
+                  response: $response,
+                  error: $error
+              }')
+          
+          echo "$log_entry" >> /var/log/dns-monitor.log
+      }
+
+      main() {
+          echo "Performing DNS check for $TARGET_DOMAIN (stage: $STAGE)"
+          
+          local dns_result success duration_ms response error
+          dns_result=$(perform_dns_query)
+          
+          success=$(echo "$dns_result" | grep "^success:" | cut -d: -f2)
+          duration_ms=$(echo "$dns_result" | grep "^duration_ms:" | cut -d: -f2)
+          response=$(echo "$dns_result" | grep "^response:" | cut -d: -f2-)
+          error=$(echo "$dns_result" | grep "^error:" | cut -d: -f2-)
+          
+          log_to_file "$success" "$duration_ms" "$response" "$error"
+          
+          if ! send_custom_metrics "$success" "$duration_ms"; then
+              echo "Failed to send custom metrics to Azure"
+          fi
+          
+          local status
+          status=$([ "$success" = "true" ] && echo "SUCCESS" || echo "FAILED")
+          printf "DNS check %s: %.2fms\n" "$status" "$duration_ms"
+          
+          [ "$success" = "false" ] && [ -n "$error" ] && echo "Error: $error"
+      }
+
+      main "$@"
+    permissions: '0755'
+
+  - path: /etc/cron.d/dns-monitor
+    content: |
+      # DNS Monitor Cron Job - runs every minute
+      * * * * * root /opt/dns-monitor/dns-monitor.sh >> /var/log/dns-monitor-cron.log 2>&1
+    permissions: '0644'
+
+runcmd:
+  - mkdir -p /opt/dns-monitor
+  - touch /var/log/dns-monitor.log
+  - touch /var/log/dns-monitor-cron.log
+  - chmod 644 /var/log/dns-monitor.log
+  - chmod 644 /var/log/dns-monitor-cron.log
+  - systemctl enable cron
+  - systemctl start cron
+  - echo "DNS Monitor setup completed" >> /var/log/cloud-init-output.log
+  - /opt/dns-monitor/dns-monitor.sh
