@@ -67,32 +67,33 @@ The system sends these metrics to Azure Monitor:
 
 Metrics are extensible - modify the Python script in `cloud-init.yml` to add new monitoring capabilities.
 
+![Azure Custom Metrics](pics/metrics.png)
+
 ## Viewing Metrics with Azure CLI
 
-You can query custom metrics using the Azure CLI:
+You can query custom metrics using the Azure REST API via `az rest`:
 
-**List available metrics for your VM:**
+**Get VM resource ID:**
 ```bash
-az monitor metrics list-definitions --resource /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/virtualMachines/<vm-name>
+VM_RESOURCE_ID=$(az vm show --resource-group <resource-group> --name <vm-name> --query id --output tsv)
 ```
 
-**Query specific custom metrics:**
+**Query custom DNS metrics:**
 ```bash
-az monitor metrics list \
-  --resource /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/virtualMachines/<vm-name> \
-  --metric "dns_query_duration" \
-  --start-time 2024-01-01T00:00:00Z \
-  --end-time 2024-01-01T23:59:59Z
+# Set time range (last 4 hours)
+START_TIME=$(date -u -v-4H +%Y-%m-%dT%H:%M:%SZ)
+END_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Query both DNS metrics
+az rest --method GET \
+  --url "https://management.azure.com$VM_RESOURCE_ID/providers/microsoft.insights/metrics?api-version=2018-01-01&metricnames=DNS_Query_Duration,DNS_Query_Success&metricNamespace=Custom/DNS&timespan=$START_TIME/$END_TIME&interval=PT1M&aggregation=Average" \
+  --output json
 ```
 
-**Query with custom metrics namespace:**
+**Use the test script:**
 ```bash
-az monitor metrics list \
-  --resource /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/virtualMachines/<vm-name> \
-  --metric "dns_query_duration" \
-  --namespace "Azure.VM.CustomMetrics" \
-  --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) \
-  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Run the provided test script for formatted output
+./testcase/retrieve-custom-metrics.sh <resource-group> <vm-name>
 ```
 
-You can get your resource ID from `terraform output` or use `az vm show` to find your VM's resource identifier.
+Custom metrics use the namespace `Custom/DNS` and may take 5-15 minutes to appear in Azure Monitor after being sent.
